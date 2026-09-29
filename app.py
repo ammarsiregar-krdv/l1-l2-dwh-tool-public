@@ -16,10 +16,96 @@ generate_recon.py's, or generate_key_metric_cols.py's logic -- it imports
 and calls them directly, exactly as the CLI does.
 """
 
+import base64
 import io
 import csv as csv_mod
+from pathlib import Path
 
 import streamlit as st
+
+
+def _get_secret(key, default=None):
+    """st.secrets.get() raises StreamlitSecretNotFoundError -- not a KeyError,
+    so the default Mapping.get() mixin doesn't catch it -- when there is NO
+    secrets.toml file at all (confirmed by direct testing, not assumed: it
+    works fine once a file exists but lacks the key, only breaks when the
+    file is fully absent). Every local run with no secrets file configured,
+    i.e. every run on this machine today, would otherwise crash outright on
+    the very first line below. This wrapper is the only thing making the
+    'local behavior is completely unchanged' claim in this file actually true."""
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+
+# ---------------------------------------------------------------------------
+# HOSTED-DEPLOYMENT BOOTSTRAP -- must run before any mapping_config-dependent
+# import below (migrate_query.py does `from mapping_config import ...` at ITS
+# OWN top level, so mapping_config.py must exist on disk before that import
+# executes, not just before app.py's own `import mapping_config` line).
+#
+# Locally: mapping_config.py already exists in this folder, this block is a
+# no-op, nothing changes about your existing workflow.
+#
+# On a hosted deployment (e.g. Streamlit Community Cloud) where the backing
+# git repo deliberately never contains mapping_config.py -- real project IDs
+# and business logic have no business sitting in a repo whose full history
+# would still expose them even after a later .gitignore -- this reconstructs
+# the file from a secret instead. See the deployment README for how to set
+# MAPPING_CONFIG_PY_B64.
+# ---------------------------------------------------------------------------
+_MAPPING_CONFIG_PATH = Path(__file__).parent / "mapping_config.py"
+if not _MAPPING_CONFIG_PATH.exists():
+    _mc_b64 = _get_secret("MAPPING_CONFIG_PY_B64")
+    if not _mc_b64:
+        st.error(
+            "mapping_config.py is missing on disk and no MAPPING_CONFIG_PY_B64 "
+            "secret is configured, so this app cannot start. This is expected "
+            "on a fresh hosted deployment before secrets are set -- see the "
+            "deployment README."
+        )
+        st.stop()
+    try:
+        _MAPPING_CONFIG_PATH.write_bytes(base64.b64decode(_mc_b64))
+    except Exception as e:
+        st.error(f"MAPPING_CONFIG_PY_B64 secret is set but couldn't be decoded ({e}). "
+                 f"Re-check it was base64-encoded correctly, no line breaks.")
+        st.stop()
+
+# ---------------------------------------------------------------------------
+# WHOLE-APP PASSWORD GATE -- only active when an APP_PASSWORD secret exists.
+# Locally, with no secrets.toml, st.secrets.get() returns None and this is a
+# complete no-op -- nothing changes about running this on your own machine.
+#
+# This is Streamlit's own documented fallback for teams without SSO ("adds
+# some level of security... NOT comparable to proper authentication with an
+# SSO provider" -- their words). It's a shared password, not per-user auth:
+# no identity, no audit trail, no revoking one person without changing it for
+# everyone. It stops a random internet visitor from seeing anything. It does
+# not stop someone the password was shared with from sharing it further.
+# ---------------------------------------------------------------------------
+_app_password = _get_secret("APP_PASSWORD")
+if _app_password and not st.session_state.get("_authed"):
+    st.title("Kredivo L1 → L2 Migration Helper")
+    entered = st.text_input("Password", type="password", key="_password_input")
+    if entered:
+        if entered == _app_password:
+            st.session_state["_authed"] = True
+            st.rerun()
+        else:
+            st.error("Wrong password.")
+    st.stop()
+
+# Feature flag: the mapping-write form. Defaults ON (matches existing local
+# behavior with no secrets.toml at all). Set ENABLE_MAPPING_WRITE = "false" in
+# the hosted deployment's secrets to hide it there -- writes made through a
+# hosted instance don't survive a container restart anyway (no persistent
+# volume by default on Community Cloud), so the real edit workflow should
+# stay on your machine, where mapping_writer.py's backup+rollback and your
+# git history actually mean something. Teammates get read + Input + Recon +
+# Batch on the hosted copy; mapping changes are still yours to make and push.
+ENABLE_MAPPING_WRITE = str(_get_secret("ENABLE_MAPPING_WRITE", "true")).lower() != "false"
 
 from migrate_query import migrate, classify_complexity
 import mapping_config
@@ -445,40 +531,48 @@ with tab_mappings:
 
     st.divider()
     st.subheader("Add a confirmed mapping")
-    st.warning(
-        "This writes directly to mapping_config.py — the project's single source of truth, "
-        "imported by every other script in this folder. A timestamped backup is made first, "
-        "and the write is rolled back automatically if the file fails to re-import afterward. "
-        "None of that protects against adding a mapping you haven't actually verified — that "
-        "part is still on you."
-    )
 
-    with st.form("add_mapping_form"):
-        old_key = st.text_input("Old table key (e.g. l2alpha.some_table)")
-        new_table = st.text_input("New table (e.g. dwh.fact_something)")
-        source_type = st.text_input("source_type (leave blank for None)")
-        add_filter = st.checkbox("This table also needs a MANDATORY_FILTERS entry")
-        filter_sql = st.text_input("Filter SQL (e.g. current_flag = 1)")
-        note = st.text_input("Note (who/when/why confirmed — goes into the file as a comment)")
-        confirm = st.checkbox("I've verified this mapping myself (schema + sample data) — not guessing")
-        submitted = st.form_submit_button("Add to mapping_config.py")
+    if not ENABLE_MAPPING_WRITE:
+        st.info(
+            "Mapping edits are made on the maintainer's local copy, not here — this hosted "
+            "instance is read + Input/Recon/Batch only. Found a mapping that needs adding? "
+            "Flag it to Ammar directly rather than waiting on this form."
+        )
+    else:
+        st.warning(
+            "This writes directly to mapping_config.py — the project's single source of truth, "
+            "imported by every other script in this folder. A timestamped backup is made first, "
+            "and the write is rolled back automatically if the file fails to re-import afterward. "
+            "None of that protects against adding a mapping you haven't actually verified — that "
+            "part is still on you."
+        )
 
-    if submitted:
-        if not (old_key.strip() and new_table.strip() and note.strip()):
-            st.error("Old table key, new table, and note are all required.")
-        elif not confirm:
-            st.error("Check the confirmation box — this file is the whole team's source of truth.")
-        elif add_filter and not filter_sql.strip():
-            st.error("You checked 'needs a MANDATORY_FILTERS entry' but left the filter SQL blank.")
-        else:
-            try:
-                backup = add_table_mapping(
-                    MAPPING_CONFIG_PATH,
-                    old_key.strip(), new_table.strip(), source_type.strip() or None, note.strip(),
-                    mandatory_filter_sql=filter_sql.strip() if add_filter else None,
-                )
-                st.success(f"Added. Backup saved at `{backup}`. Commit this in git if the repo "
-                           f"is version-controlled — right now that backup file is the only history.")
-                st.rerun()
-            except MappingWriteError as e:
-                st.error(str(e))
+        with st.form("add_mapping_form"):
+            old_key = st.text_input("Old table key (e.g. l2alpha.some_table)")
+            new_table = st.text_input("New table (e.g. dwh.fact_something)")
+            source_type = st.text_input("source_type (leave blank for None)")
+            add_filter = st.checkbox("This table also needs a MANDATORY_FILTERS entry")
+            filter_sql = st.text_input("Filter SQL (e.g. current_flag = 1)")
+            note = st.text_input("Note (who/when/why confirmed — goes into the file as a comment)")
+            confirm = st.checkbox("I've verified this mapping myself (schema + sample data) — not guessing")
+            submitted = st.form_submit_button("Add to mapping_config.py")
+
+        if submitted:
+            if not (old_key.strip() and new_table.strip() and note.strip()):
+                st.error("Old table key, new table, and note are all required.")
+            elif not confirm:
+                st.error("Check the confirmation box — this file is the whole team's source of truth.")
+            elif add_filter and not filter_sql.strip():
+                st.error("You checked 'needs a MANDATORY_FILTERS entry' but left the filter SQL blank.")
+            else:
+                try:
+                    backup = add_table_mapping(
+                        MAPPING_CONFIG_PATH,
+                        old_key.strip(), new_table.strip(), source_type.strip() or None, note.strip(),
+                        mandatory_filter_sql=filter_sql.strip() if add_filter else None,
+                    )
+                    st.success(f"Added. Backup saved at `{backup}`. Commit this in git if the repo "
+                               f"is version-controlled — right now that backup file is the only history.")
+                    st.rerun()
+                except MappingWriteError as e:
+                    st.error(str(e))
